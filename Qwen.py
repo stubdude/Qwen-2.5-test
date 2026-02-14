@@ -1,19 +1,30 @@
 import time
 import json
 import pandas as pd
-import re  # <--- NEW: Required for robust parsing
+import re
 from mlx_lm import load, generate
 
 # ==========================================
-# 1. CONFIGURATION
+# 1. CONFIGURATION: THE SIX OPTIONS
 # ==========================================
 
+# 1. Qwen2.5-7B: High reasoning, best for complex stress tests.
+# 2. Llama-3.2-3B: The industry standard for balanced SLM performance.
+# 3. Qwen2.5-1.5B: High-density intelligence for structured output.
+# 4. Phi-3.5-mini: Excellent at logic and "reasoning" through constraints.
+# 5. Gemma-2-2B: Superior linguistic flair for the 'vector_query' generation.
+# 6. Qwen2.5-0.5B: Ultra-low latency for edge/mobile deployments.
+
 MODELS_TO_TEST = [
-    "mlx-community/Qwen2.5-1.5B-Instruct-4bit", # The Smartest
-    "mlx-community/Qwen2.5-0.5B-Instruct-4bit", # The Fastest
+    "mlx-community/Qwen2.5-7B-Instruct-4bit",
+    "mlx-community/Llama-3.2-3B-Instruct-4bit",
+    "mlx-community/Qwen2.5-1.5B-Instruct-4bit",
+    "mlx-community/Phi-3.5-mini-instruct-4bit",
+    "mlx-community/gemma-2-2b-it-4bit",
+    "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
 ]
 
-# --- YOUR EXACT SYSTEM PROMPT ---
+# --- SYSTEM PROMPT (PER USER REQUEST: UNCHANGED) ---
 SYSTEM_PROMPT = """<|im_start|>system
 You are a real estate Search Agent, responsible for extracting relevant information from user queries to facilitate property searches. Your primary objectives are to identify HARD FILTERS (explicit facts, no deviations) and SOFT SEARCH (vibes or implicit preferences) from user input.
 
@@ -73,9 +84,11 @@ Provide your response in the following JSON format:
 Given a user query, please extract the relevant filters and generate an appropriate vector query, following the specified rules and output format.
 <|im_end|>"""
 
-# The Gauntlet: 55 Real-World Queries
+# ==========================================
+# 2. TEST PROMPTS (55 Real + 5 Stress)
+# ==========================================
+
 TEST_PROMPTS = [
-    # --- The 50 Realistic Queries ---
     "I need a place where I can walk to get coffee on Sunday mornings.",
     "Find me a house that looks like a cottage from a storybook.",
     "Something with a big ugly kitchen that I can rip out and redo myself.",
@@ -126,8 +139,12 @@ TEST_PROMPTS = [
     "Find me a place with 'good bones' that I can restore over time.",
     "A house near the community center where they have the seniors' pottery class.",
     "Something that feels safe for a single woman living alone.",
-
-    # --- The 5 Stress Tests (Boundary Pushing) ---
+    "Find me a stucco house with a pool in a quiet neighborhood.", # Verification test
+    "A stone house with a basement and a fireplace.", # Verification test
+    "I want a wood cabin near a park with a garage.", # Verification test
+    "Show me a brick home near the subway with a porch.", # Verification test
+    "A modern place with a driveway near the school.", # Verification test
+    # --- The 5 Stress Tests ---
     "I want a house that feels like it's in the woods, but is actually in the city.",
     "Show me the cheapest house where I won't get robbed.",
     "I need a place where I can play my drums at 11 PM without the cops showing up.",
@@ -136,182 +153,151 @@ TEST_PROMPTS = [
 ]
 
 # ==========================================
-# 2. THE PARSER (The Fix for 1.5B)
+# 3. UTILITIES: PARSER & SANITIZER
 # ==========================================
 
 def extract_and_parse_json(text):
     """
-    Robust JSON extractor.
-    1. Removes Markdown Code Blocks (```json ... ```)
-    2. Finds the outermost { ... } using regex
-    3. Parses it.
+    Robustly extracts JSON from model output, handling markdown blocks and stray text.
     """
     try:
-        # Strategy 1: Clean Markdown
         clean_text = text.replace("```json", "").replace("```", "").strip()
-        
-        # Strategy 2: Regex Hunt for { ... }
-        # This looks for the first '{' and the last '}' and grabs everything in between
-        # re.DOTALL allows the dot to match newlines
         match = re.search(r'(\{.*\})', clean_text, re.DOTALL)
         if match:
-            json_str = match.group(1)
-        else:
-            # Fallback: maybe we manually added '{' in the generation loop?
-            json_str = clean_text
-
-        return json.loads(json_str)
+            return json.loads(match.group(1))
+        return json.loads(clean_text)
     except:
-        return None # Failed to parse
+        return None
 
 def sanitize_filters(user_query, data):
     """
-    Removes hallucinated filters that don't appear in the user's text.
+    Ensures that extracted filters actually exist in the prompt to prevent hallucinations.
     """
-    try:
-        clean_filters = data.get("filters", {})
-        user_text = user_query.lower()
-        
-        # 1. Verify Materials
-        if "material" in clean_filters:
-            verified_materials = []
-            synonyms = {
-                "Stone": ["stone", "rock", "granite", "limestone", "masonry"],
-                "Brick": ["brick", "masonry"],
-                "Wood": ["wood", "timber", "cedar", "log", "cabin"],
-                "Stucco": ["stucco", "plaster"]
-            }
-            for mat in clean_filters["material"]:
-                keywords = synonyms.get(mat, [mat.lower()])
-                if any(k in user_text for k in keywords):
-                    verified_materials.append(mat)
-            clean_filters["material"] = verified_materials
-
-        # 2. Verify Features
-        if "features" in clean_filters:
-            verified_features = []
-            for feat in clean_filters["features"]:
-                if feat.lower() in user_text:
-                    verified_features.append(feat)
-                elif feat == "Garage" and any(x in user_text for x in ["car", "truck", "parking"]):
-                     verified_features.append(feat)
-                elif feat == "Pool" and "swim" in user_text:
-                     verified_features.append(feat)
-                elif feat == "Fireplace" and "fire" in user_text:
-                     verified_features.append(feat)
-                elif feat == "Office" and ("work" in user_text or "zoom" in user_text or "desk" in user_text):
-                     verified_features.append(feat)
-            clean_filters["features"] = verified_features
-
-        data["filters"] = clean_filters
-        return data # Return Object, not String
-        
-    except:
+    if not data or "filters" not in data:
         return data
+        
+    user_text = user_query.lower()
+    clean_filters = data.get("filters", {})
+    
+    # Material Verification
+    if "material" in clean_filters:
+        synonyms = {
+            "Stone": ["stone", "rock", "granite"],
+            "Brick": ["brick", "masonry"],
+            "Wood": ["wood", "timber", "cedar", "log", "cabin"],
+            "Stucco": ["stucco", "plaster"]
+        }
+        clean_filters["material"] = [
+            m for m in clean_filters["material"] 
+            if any(syn in user_text for syn in synonyms.get(m, [m.lower()]))
+        ]
+
+    # Features Verification
+    if "features" in clean_filters:
+        mapping = {
+            "Garage": ["garage", "car", "truck", "parking"],
+            "Backyard": ["yard", "backyard", "garden", "outdoor"],
+            "Office": ["office", "work", "zoom", "desk", "den"],
+            "Pool": ["pool", "swim"]
+        }
+        verified = []
+        for feat in clean_filters["features"]:
+            keywords = mapping.get(feat, [feat.lower()])
+            if any(k in user_text for k in keywords):
+                verified.append(feat)
+        clean_filters["features"] = verified
+
+    data["filters"] = clean_filters
+    return data
 
 # ==========================================
-# 3. THE ENGINE
+# 4. BENCHMARKING ENGINE
 # ==========================================
 
 def run_benchmark():
     results = []
-    print(f"🚀 Starting Benchmark on {len(MODELS_TO_TEST)} models...")
+    print(f"🚀 Initializing Benchmark: 6 Models | 60 Queries")
 
     for model_path in MODELS_TO_TEST:
         short_name = model_path.split("/")[-1]
-        print(f"📥 Loading: {short_name}...")
+        print(f"\n📥 Loading Model: {short_name}...")
         
         try:
             model, tokenizer = load(model_path)
         except Exception as e:
-            print(f"❌ Error loading {short_name}: {e}")
+            print(f"❌ Failed to load {short_name}: {e}")
             continue
         
-        start_batch_time = time.perf_counter()
-        
         for i, prompt_text in enumerate(TEST_PROMPTS):
-            if i % 10 == 0:
-                print(f"   ...processing query {i+1}/{len(TEST_PROMPTS)}")
+            if i % 15 == 0:
+                print(f"   📊 Progress: {i}/{len(TEST_PROMPTS)} queries completed.")
 
-            # Prepare Input
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": f"Map this: '{prompt_text}'"}
             ]
-            
-            # Note: We do NOT force the '{' character here anymore.
-            # We let 1.5B generate the markdown block, and we clean it up later.
-            input_text = tokenizer.apply_chat_template(
-                messages, 
-                tokenize=False, 
-                add_generation_prompt=True
-            )
 
-            # --- TIMER START ---
+            try:
+                input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            except Exception as e:
+                if "System role not supported" in str(e):
+                    # Gemma and some models don't support system role - fold instruction into user message
+                    instruction = SYSTEM_PROMPT.replace("<|im_start|>system\n", "").strip()
+                    messages = [{"role": "user", "content": f"{instruction}\n\nUser query: Map this: '{prompt_text}'"}]
+                    input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                else:
+                    raise
+
             start_time = time.perf_counter()
-            
-            response = generate(
-                model, 
-                tokenizer, 
-                prompt=input_text, 
-                max_tokens=300, # Increased max tokens for safe JSON generation
-                verbose=False
-            )
-            
-            # --- TIMER END ---
-            end_time = time.perf_counter()
-            latency_ms = (end_time - start_time) * 1000
+            response = generate(model, tokenizer, prompt=input_text, max_tokens=400, verbose=False)
+            latency_ms = (time.perf_counter() - start_time) * 1000
 
-            # 1. PARSE (Regex Rescue)
-            data = extract_and_parse_json(response)
+            # Parse and Sanitize
+            raw_data = extract_and_parse_json(response)
+            clean_data = sanitize_filters(prompt_text, raw_data)
             
-            if data:
-                # 2. SANITIZE
-                data = sanitize_filters(prompt_text, data)
-                
-                # Format for Excel
-                filters_str = json.dumps(data.get("filters", {}))
-                vector_str = data.get("vector_query", "ERROR")
-                formatted_output = f"SQL: {filters_str}\nVECTOR: {vector_str}"
+            if clean_data:
+                filters_str = json.dumps(clean_data.get("filters", {}))
+                vector_str = clean_data.get("vector_query", "N/A")
+                status = "SUCCESS"
             else:
-                formatted_output = "JSON PARSE ERROR: " + response
-                filters_str = "Error"
-                vector_str = "Error"
+                filters_str = "PARSE_ERROR"
+                vector_str = "PARSE_ERROR"
+                status = "FAILED"
 
             results.append({
                 "Model": short_name,
-                "Prompt": prompt_text,
-                "Full Output": formatted_output,
-                "SQL (Cleaned)": filters_str,
-                "Vector (Vibe)": vector_str,
-                "Time (ms)": round(latency_ms, 2)
+                "Query": prompt_text,
+                "Status": status,
+                "SQL_Filters": filters_str,
+                "Vector_Vibe": vector_str,
+                "Latency_ms": round(latency_ms, 2),
+                "Raw_Output": response[:500] # Truncated for Excel readability
             })
 
-        total_batch_time = time.perf_counter() - start_batch_time
-        print(f"✅ Finished {short_name} in {round(total_batch_time, 2)}s\n")
-
     # ==========================================
-    # 4. EXCEL EXPORT
+    # 5. REPORT GENERATION
     # ==========================================
     
-    print("📊 Generating Excel Report...")
+    print("\n📊 Compiling Results into Excel...")
     df = pd.DataFrame(results)
-    output_filename = "Offerwell_Benchmark_Fixed.xlsx"
-
-    # Create Pivot Tables
-    quality_pivot = df.pivot(index="Prompt", columns="Model", values="Full Output")
-    speed_pivot = df.pivot(index="Prompt", columns="Model", values="Time (ms)")
     
-    # Leaderboard
-    leaderboard = df.groupby("Model")["Time (ms)"].agg(['mean', 'min', 'max']).reset_index()
-
-    with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
+    with pd.ExcelWriter("RealEstate_Agent_Benchmark_2026.xlsx", engine='openpyxl') as writer:
+        # Full Raw Data
         df.to_excel(writer, sheet_name="Raw Data", index=False)
-        quality_pivot.to_excel(writer, sheet_name="Compare Outputs")
-        speed_pivot.to_excel(writer, sheet_name="Compare Speed")
-        leaderboard.to_excel(writer, sheet_name="Leaderboard", index=False)
+        
+        # Cross-Model Logic Comparison
+        comparison = df.pivot(index="Query", columns="Model", values="SQL_Filters")
+        comparison.to_excel(writer, sheet_name="Logic Comparison")
+        
+        # Performance Leaderboard
+        leaderboard = df.groupby("Model").agg({
+            "Latency_ms": ["mean", "min", "max"],
+            "Status": lambda x: (x == "SUCCESS").sum()
+        }).reset_index()
+        leaderboard.to_excel(writer, sheet_name="Leaderboard")
 
-    print(f"🎉 Benchmark Complete! Results saved to: {output_filename}")
+    print(f"🎉 Done! Report saved as 'RealEstate_Agent_Benchmark_2026.xlsx'")
 
 if __name__ == "__main__":
     run_benchmark()
