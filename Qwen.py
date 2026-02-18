@@ -5,160 +5,184 @@ import re
 from mlx_lm import load, generate
 
 # ==========================================
-# 1. CONFIGURATION: THE SIX OPTIONS
+# 1. CONFIGURATION: MODEL SELECTION
 # ==========================================
-
-# 1. Qwen2.5-7B: High reasoning, best for complex stress tests.
-# 2. Llama-3.2-3B: The industry standard for balanced SLM performance.
-# 3. Qwen2.5-1.5B: High-density intelligence for structured output.
-# 4. Phi-3.5-mini: Excellent at logic and "reasoning" through constraints.
-# 5. Gemma-2-2B: Superior linguistic flair for the 'vector_query' generation.
-# 6. Qwen2.5-0.5B: Ultra-low latency for edge/mobile deployments.
 
 MODELS_TO_TEST = [
     "mlx-community/Qwen2.5-7B-Instruct-4bit",
     "mlx-community/Llama-3.2-3B-Instruct-4bit",
     "mlx-community/Qwen2.5-1.5B-Instruct-4bit",
     "mlx-community/Phi-3.5-mini-instruct-4bit",
-    "mlx-community/gemma-2-2b-it-4bit",
     "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
 ]
 
-# --- SYSTEM PROMPT (PER USER REQUEST: UNCHANGED) ---
+# ==========================================
+# 2. PRODUCTION SYSTEM PROMPT
+# ==========================================
+
 SYSTEM_PROMPT = """<|im_start|>system
-You are a real estate Search Agent, responsible for extracting relevant information from user queries to facilitate property searches. Your primary objectives are to identify HARD FILTERS (explicit facts, no deviations) and SOFT SEARCH (vibes or implicit preferences) from user input.
+You are the Offerwell Search Agent. Your goal is to split user intent into HARD FACTS (SQL) and VISUAL AESTHETICS (Vector).
+
+### CORE OBJECTIVE
+You must generate a `vector_query` that describes **ONLY what is visible in a property photograph**. 
+The Vector Database uses CLIP (Computer Vision), which cannot "see" concepts like "safe", "quiet", "near schools", or "good investment".
 
 ### INSTRUCTIONS
-1. **EXPLICIT FILTERS ONLY**: Extract filters (features, material, location_signals) if the user explicitly mentions them. Do not infer or assume information not provided. Only use the features, material, and location_signals that are explicitly mentioned.
-2. **DEFAULT VALUES**: If a user does not specify a material or any features, return an empty list [] for the respective field.
-3. **AVOID ASSUMPTIONS**: Refrain from making assumptions about the user's preferences unless explicitly stated.
+1. **EXTRACT HARD FILTERS**: specific features, materials, or location categories mentioned explicitly.
+2. **GENERATE VECTOR VISUALS**: Convert the user's "Vibe" into physical, photographic descriptors.
+3. **APPLY THE CAMERA TEST**: 
+   - Can a camera see "Near Hertel"? NO -> Do not put in vector_query.
+   - Can a camera see "Exposed Brick"? YES -> Put in vector_query.
+   - Can a camera see "Quiet"? NO -> Do not put in vector_query.
 
-### DEFINED FIELDS FOR FILTERS
-- **features**: ["Kitchen", "Garage", "Backyard", "Basement", "Pool", "Porch", "Driveway", "Office", "Fireplace"]
-- **material**: ["Stone", "Brick", "Wood", "Stucco"]
-- **location_signals**: ["School", "Park", "Bars", "Water", "Highway", "Subway", "Quiet"]
+### DEFINED FIELDS (STRICT ENUMERATION)
+- **features**: [
+    "Kitchen", "Chef's Kitchen", "Island", "Pantry",
+    "Garage", "Carport", "Driveway", "EV Charger",
+    "Backyard", "Fenced Yard", "Pool", "Hot Tub", "Deck", "Patio", "Porch", "Balcony", "Garden",
+    "Basement", "Finished Basement", "Attic",
+    "Office", "Den", "Gym", "Home Theater", "Mudroom", "Laundry Room",
+    "Fireplace", "Wood Stove",
+    "Hardwood", "Carpet", "Exposed Brick",
+    "Central Air", "AC", "Solar Panels",
+    "Single Story", "Open Floor Plan", "ADU", "Guest House", "In-Law Suite", "Loft"
+  ]
+- **material**: ["Brick", "Stone", "Wood", "Vinyl", "Stucco", "Concrete", "Log", "Metal", "Glass"]
+- **location_signals**: [
+    "School", "University",
+    "Park", "Trail", "Lake", "River", "Ocean", "Beach", "Mountain",
+    "Subway", "Bus", "Train", "Highway", "Airport", "Walkable",
+    "Coffee", "Bar", "Restaurant", "Grocery", "Shopping",
+    "Quiet", "Private", "Gated", "Cul-de-sac", "City", "Country"
+  ]
 
-### OUTPUT REQUIREMENTS
-Provide your response in the following JSON format:
+### OUTPUT FORMAT (JSON)
 {
-"filters": {
-"features": [...],  // List of explicitly mentioned features
-"material": [...],  // List of explicitly mentioned materials
-"location_signals": [...]  // List of explicitly mentioned location signals
-},
-"vector_query": "...",  // A string representing the soft search query (vibes or implicit preferences)
+  "filters": {
+    "features": [],
+    "material": [],
+    "location_signals": []
+  },
+  "vector_query": "string"
 }
 
+### EXAMPLES
 
-### EXAMPLE RESPONSES
-- For the query "I want a cozy cottage near the lake.", the output should be:
-{
-"filters": {
-"features": [],
-"material": [],
-"location_signals": ["Water"]
-},
-"vector_query": "Cozy cottage, lakefront, water view, cabin aesthetic, rustic, warm lighting"
+User: "I want a quiet house near Hertel with a storybook vibe."
+Output: {
+  "filters": {"features": [], "material": [], "location_signals": ["Quiet", "Bar", "Restaurant"]}, 
+  "vector_query": "Storybook cottage, tudor style, thatched roof, whimsical, stone exterior, arched doorway, ivy"
 }
+*Note: "Hertel" (Location) and "Quiet" (Sound) are removed from vector_query. "Storybook" is expanded to visual terms.*
 
-- For the query "Find me a modern brick house with a garage.", the output should be:
-{
-"filters": {
-"features": ["Garage"],
-"material": ["Brick"],
-"location_signals": []
-},
-"vector_query": "Modern architecture, red brick, contemporary design, sleek"
+User: "Find me a modern concrete home with solar panels near the subway."
+Output: {
+  "filters": {"features": ["Solar Panels"], "material": ["Concrete"], "location_signals": ["Subway"]},
+  "vector_query": "Modern architecture, brutalist design, concrete facade, minimalist, floor to ceiling windows, flat roof"
 }
+*Note: "Subway" is removed from vector_query because you cannot see the subway in the house photo.*
 
-- For the query "A place to walk to get coffee.", the output should be:
-{
-"filters": {
-"features": [],
-"material": [],
-"location_signals": []
-},
-"vector_query": "Walkable neighborhood, coffee shops nearby, sunday morning vibe, urban village"
+User: "Something with a big ugly kitchen I can rip out."
+Output: {
+  "filters": {"features": ["Kitchen"], "material": [], "location_signals": []},
+  "vector_query": "Dated kitchen, old cabinetry, linoleum floor, fluorescent lighting, wood paneling, 1970s style, fixer upper interior"
 }
-
-Given a user query, please extract the relevant filters and generate an appropriate vector query, following the specified rules and output format.
+*Note: "Ugly" is translated into specific visual features of an ugly room.*
 <|im_end|>"""
 
 # ==========================================
-# 2. TEST PROMPTS (55 Real + 5 Stress)
+# 3. EXPANDED TEST PROMPTS
 # ==========================================
 
 TEST_PROMPTS = [
-    "I need a place where I can walk to get coffee on Sunday mornings.",
-    "Find me a house that looks like a cottage from a storybook.",
-    "Something with a big ugly kitchen that I can rip out and redo myself.",
-    "A backyard that feels totally private, where I won't see my neighbors.",
-    "I have three dogs, so I need a massive fenced yard, not just a patio.",
-    "A place with huge windows—I have a lot of houseplants that need light.",
-    "Show me homes near the elementary school so my kids can walk there safely.",
-    "I want a house that feels 'historic' but doesn't have drafty old windows.",
-    "A condo where I won't hear the person upstairs walking around.",
-    "Something close to the bars on Hertel but far enough away that it’s quiet at night.",
-    "A starter home that isn't falling apart, maybe just needs some paint.",
-    "I need a garage big enough for my truck and a workbench.",
-    "Is there a place where I can legally build a rental unit in the back for extra income?",
-    "A house with a porch where I can actually sit and watch the rain.",
-    "Find me a modern-looking apartment, I hate carpet and popcorn ceilings.",
-    "A place near the park with the good running trails.",
-    "I want a kitchen with an island where my friends can hang out while I cook.",
-    "Something single-story—my knees can't do stairs anymore.",
-    "A house that smells like old wood and books, like a library.",
-    "I need a spare room that would make a good quiet office for Zoom calls.",
-    "Find me a cheap house in a neighborhood that’s getting better.",
-    "A place with a driveway, I'm tired of fighting for street parking.",
-    "I want a dining room big enough for my grandmother's 10-person table.",
-    "Show me homes near the highway on-ramp, I have a long commute.",
-    "A place with a 'granny flat' or separate entrance for my mom.",
-    "I need a house with gas cooking, electric stoves are a dealbreaker.",
-    "Something with a finished basement where the kids can play video games.",
-    "A house with character—arches, crown molding, weird little nooks.",
-    "I want to live near other young families, not a retirement community.",
-    "Find me a place with a view of the water, even if it's just a sliver.",
-    "A house with a big front tree that’s perfect for a tire swing.",
-    "I need a laundry room on the main floor, not in the scary basement.",
-    "Something with a low-maintenance yard, I travel too much to mow grass.",
-    "A place that gets good afternoon sun in the living room.",
-    "I want a bathroom that feels like a spa, with a deep tub.",
-    "Find me a house near a grocery store so I don't have to drive for milk.",
-    "A place with exposed brick, I love that industrial loft look.",
-    "I need a house that’s not in a flood zone, I’m worried about the basement.",
-    "Something with a fireplace for the winter, real wood if possible.",
-    "A house where I can have chickens in the backyard without the city fining me.",
-    "I want a place with a 'mudroom' area for all our winter boots and coats.",
-    "Find me a house that feels bright and airy, not dark and cave-like.",
-    "A place near the subway station so I can sell my second car.",
-    "I need a backyard that’s flat enough for a skating rink in the winter.",
-    "Something with two actual bathrooms, not one and a half.",
-    "A house where I can build a massive deck for summer parties.",
-    "I want a bedroom that’s dark and quiet, away from the street lights.",
-    "Find me a place with 'good bones' that I can restore over time.",
-    "A house near the community center where they have the seniors' pottery class.",
-    "Something that feels safe for a single woman living alone.",
-    "Find me a stucco house with a pool in a quiet neighborhood.", # Verification test
-    "A stone house with a basement and a fireplace.", # Verification test
-    "I want a wood cabin near a park with a garage.", # Verification test
-    "Show me a brick home near the subway with a porch.", # Verification test
-    "A modern place with a driveway near the school.", # Verification test
-    # --- The 5 Stress Tests ---
-    "I want a house that feels like it's in the woods, but is actually in the city.",
-    "Show me the cheapest house where I won't get robbed.",
-    "I need a place where I can play my drums at 11 PM without the cops showing up.",
-    "Find me a house that looks ugly now but is in a neighborhood where everyone else is renovating.",
-    "I want a kitchen exactly like the one in 'Something's Gotta Give'."
+    # --- Simple / Direct Home Searches ---
+    "3 bedroom home with a big backyard in a safe neighborhood under $500,000",
+    "Condo near coffee shops and restaurants in a walkable downtown area",
+    "Family home near top-rated elementary schools in the suburbs",
+    "Quiet neighborhood with low crime and good schools in the Phoenix area",
+    "Move-in ready house with a garage in a well-kept neighborhood",
+    "Home with a covered porch in a warm climate with mild winters",
+    "Townhouse in a walkable area with cafes and parks within walking distance",
+    "Single-family home in a neighborhood with young families and good schools",
+    "Newer construction home in a growing suburb with strong community feel",
+    "Apartment near trendy coffee shops and a farmers market",
+
+    # --- Weather & Climate Preferences ---
+    "A home in a warm, sunny climate where it rarely gets below 50 degrees in winter",
+    "Something in the Pacific Northwest with a cozy feel — I don't mind the rain but want a dry, insulated home",
+    "A property in a mild four-season climate, nothing too extreme in summer or winter",
+    "A house in Florida but in an area that doesn't feel the worst of hurricane season",
+    "A mountain town home that gets real snow in winter but isn't brutally cold all year",
+
+    # --- Schools & Family-Oriented ---
+    "A home zoned for one of the top-rated public high schools in the district",
+    "Family neighborhood with highly rated schools, a park nearby, and low traffic streets",
+    "Something in a suburb known for strong public schools and safe streets for kids to play outside",
+    "A home where I can walk my kids to school and feel safe doing it",
+    "Neighborhood with good middle schools, other families around, and enough space for the kids to have their own rooms",
+
+    # --- Safety & Crime ---
+    "A neighborhood where I'd feel comfortable going for a jog at night",
+    "Low crime area with a strong sense of community — the kind where neighbors look out for each other",
+    "Safe, quiet street in a well-established neighborhood, nothing transitional or up-and-coming",
+    "A home in a neighborhood that feels genuinely safe, not just technically okay on paper",
+    "Family-friendly area with low crime where I don't have to worry about leaving my car in the driveway",
+
+    # --- Walkability & Lifestyle ---
+    "Walking distance to a good coffee shop, ideally also near a gym and a grocery store",
+    "A neighborhood where I can run errands on foot and grab brunch without getting in the car",
+    "Somewhere with a real walkable main street — independent cafes, bookstores, maybe a farmers market on weekends",
+    "A place where I can walk to dinner and feel like I'm actually living somewhere, not just sleeping there",
+    "Urban or near-urban home where most of my daily needs are within a 10-minute walk",
+
+    # --- Neighborhood Quality & Demographics ---
+    "An established, well-maintained neighborhood where homes are clearly taken care of and pride of ownership shows",
+    "A neighborhood that feels upscale without being pretentious — good restaurants, clean streets, well-landscaped homes",
+    "A diverse, inclusive neighborhood with a strong local identity and community events",
+    "A neighborhood on the rise — still affordable but clearly improving, with new businesses coming in",
+    "A mature neighborhood with older trees, wide sidewalks, and homes that have character and history",
+
+    # --- Permits & Home Features ---
+    "A home with an existing permitted ADU I could rent out for extra income",
+    "A property with a finished basement that was properly permitted and isn't a DIY situation",
+    "A house where the addition or renovation was done with permits pulled — I don't want surprises",
+    "A home with a permitted garage conversion that could work as a home office or guest suite",
+    "Something with a pool that was built properly with permits and has been well maintained",
+
+    # --- Complex & Multi-Variable ---
+    "I work from home and want a dedicated office space, walkable neighborhood with cafes, and a low-crime area — budget around $550,000",
+    "Relocating from NYC with two kids and a dog. Need top schools, a yard, safe streets, and a neighborhood with some personality. Budget is $700,000.",
+    "Looking for a forever home in a warm climate, great schools, walkable to at least a few restaurants, and a neighborhood that's clearly well cared for",
+    "We want something affordable but in a neighborhood that's heading in the right direction — improving schools, new cafes opening, safer than it was five years ago",
+    "Retiring soon and want a low-maintenance home in a warm, walkable town where we can age in place comfortably and feel safe",
+
+    # --- Narrative / Conversational ---
+    "My wife and I both work remotely and just want a beautiful, calm neighborhood where we can take walks, grab coffee, and not worry about crime. Price isn't our only concern — neighborhood feel matters more.",
+    "First-time buyer here. I want a starter home in a neighborhood I'll actually enjoy living in — safe, some walkability, decent schools even if we don't have kids yet",
+    "I grew up in a small town and want that same feeling — neighbors who say hi, kids playing outside, local shops. What does that look like in a mid-size metro area?",
+    "We've been burned before by a neighborhood that looked fine online but felt off in person. I want data and real insight on what the neighborhood is actually like day to day",
+    "Looking for a home that checks all the boxes — safe, walkable, great schools, good weather — but also just feels like somewhere we'd be proud to live and happy to come home to every day",
+
+    # --- General ---
+    "3 bed 2 bath in a safe quiet neighborhood in Buffalo under $400k",
+    "Walkable area, good coffee shops, 2 bedroom, don't care about yard",
+    "Family home near good schools, big backyard, safe street, around $500k",
+    "Something cozy with character, established neighborhood, not a cookie cutter development",
+    "Need a home office room, quiet area, close to amenities, budget $450k",
+    "Warm weather, low crime, walkable — open to any city, just show me options",
+    "Starter home, safe area, decent schools, anything under $350k",
+    "Downsizing, want something small and low maintenance in a nice walkable neighborhood",
+    "2 bed condo downtown, want to walk to restaurants and coffee, modern building",
+    "Moving with two kids, need top schools, yard, safe neighborhood, up to $600k",
 ]
 
 # ==========================================
-# 3. UTILITIES: PARSER & SANITIZER
+# 4. UTILITIES: PARSER & UPGRADED SANITIZER
 # ==========================================
 
 def extract_and_parse_json(text):
     """
-    Robustly extracts JSON from model output, handling markdown blocks and stray text.
+    Robustly extracts JSON from model output.
     """
     try:
         clean_text = text.replace("```json", "").replace("```", "").strip()
@@ -171,7 +195,8 @@ def extract_and_parse_json(text):
 
 def sanitize_filters(user_query, data):
     """
-    Ensures that extracted filters actually exist in the prompt to prevent hallucinations.
+    Ensures that extracted filters actually exist in the prompt.
+    Expanded to handle the new production fields.
     """
     if not data or "filters" not in data:
         return data
@@ -179,44 +204,51 @@ def sanitize_filters(user_query, data):
     user_text = user_query.lower()
     clean_filters = data.get("filters", {})
     
-    # Material Verification
-    if "material" in clean_filters:
-        synonyms = {
-            "Stone": ["stone", "rock", "granite"],
-            "Brick": ["brick", "masonry"],
-            "Wood": ["wood", "timber", "cedar", "log", "cabin"],
-            "Stucco": ["stucco", "plaster"]
-        }
-        clean_filters["material"] = [
-            m for m in clean_filters["material"] 
-            if any(syn in user_text for syn in synonyms.get(m, [m.lower()]))
-        ]
+    # 1. Define Synonyms for Common Mismatches
+    # If the user says "rental unit", the model outputs "ADU". We need to allow that.
+    synonym_map = {
+        "ADU": ["rental unit", "granny flat", "guest house", "in-law", "income"],
+        "In-Law Suite": ["mother", "granny", "guest", "separate entrance"],
+        "EV Charger": ["electric car", "tesla", "plug", "charging"],
+        "Solar Panels": ["solar", "energy", "green"],
+        "Office": ["work", "zoom", "desk", "den", "study"],
+        "Gym": ["workout", "fitness", "yoga", "weights"],
+        "Cul-de-sac": ["dead end", "court", "circle"],
+        "Hardwood": ["wood floor", "hard wood", "oak", "maple"],
+        "Garage": ["car", "parking", "storage"],
+        "Fenced Yard": ["fence", "dog", "secure"],
+        "Subway": ["train", "metro", "station", "transit"],
+        "Walkable": ["walk", "pedestrian"],
+    }
 
-    # Features Verification
-    if "features" in clean_filters:
-        mapping = {
-            "Garage": ["garage", "car", "truck", "parking"],
-            "Backyard": ["yard", "backyard", "garden", "outdoor"],
-            "Office": ["office", "work", "zoom", "desk", "den"],
-            "Pool": ["pool", "swim"]
-        }
-        verified = []
-        for feat in clean_filters["features"]:
-            keywords = mapping.get(feat, [feat.lower()])
-            if any(k in user_text for k in keywords):
-                verified.append(feat)
-        clean_filters["features"] = verified
+    # 2. General Verification Loop
+    for category in ["features", "material", "location_signals"]:
+        if category in clean_filters:
+            verified = []
+            for item in clean_filters[category]:
+                # Check A: Exact match in text (e.g., user said "Pool")
+                if item.lower() in user_text:
+                    verified.append(item)
+                    continue
+                
+                # Check B: Synonym match (e.g., user said "Tesla" -> "EV Charger")
+                # Look up the item in our map, get list of keywords, check if ANY exist in user text
+                keywords = synonym_map.get(item, [])
+                if any(k in user_text for k in keywords):
+                    verified.append(item)
+            
+            clean_filters[category] = verified
 
     data["filters"] = clean_filters
     return data
 
 # ==========================================
-# 4. BENCHMARKING ENGINE
+# 5. BENCHMARKING ENGINE
 # ==========================================
 
 def run_benchmark():
     results = []
-    print(f"🚀 Initializing Benchmark: 6 Models | 60 Queries")
+    print(f"🚀 Initializing Production Benchmark: {len(MODELS_TO_TEST)} Models | {len(TEST_PROMPTS)} Queries")
 
     for model_path in MODELS_TO_TEST:
         short_name = model_path.split("/")[-1]
@@ -238,18 +270,16 @@ def run_benchmark():
             ]
 
             try:
+                # Handle models that don't support system roles elegantly
                 input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            except Exception as e:
-                if "System role not supported" in str(e):
-                    # Gemma and some models don't support system role - fold instruction into user message
-                    instruction = SYSTEM_PROMPT.replace("<|im_start|>system\n", "").strip()
-                    messages = [{"role": "user", "content": f"{instruction}\n\nUser query: Map this: '{prompt_text}'"}]
-                    input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                else:
-                    raise
+            except:
+                # Fallback format
+                instruction = SYSTEM_PROMPT.replace("<|im_start|>system\n", "").strip()
+                prompt_content = f"{instruction}\n\nUser query: Map this: '{prompt_text}'"
+                input_text = f"<|user|>\n{prompt_content}\n<|assistant|>\n"
 
             start_time = time.perf_counter()
-            response = generate(model, tokenizer, prompt=input_text, max_tokens=400, verbose=False)
+            response = generate(model, tokenizer, prompt=input_text, max_tokens=500, verbose=False)
             latency_ms = (time.perf_counter() - start_time) * 1000
 
             # Parse and Sanitize
@@ -272,32 +302,29 @@ def run_benchmark():
                 "SQL_Filters": filters_str,
                 "Vector_Vibe": vector_str,
                 "Latency_ms": round(latency_ms, 2),
-                "Raw_Output": response[:500] # Truncated for Excel readability
+                "Raw_Output": response[:500] 
             })
 
     # ==========================================
-    # 5. REPORT GENERATION
+    # 6. REPORT GENERATION
     # ==========================================
     
     print("\n📊 Compiling Results into Excel...")
     df = pd.DataFrame(results)
     
-    with pd.ExcelWriter("RealEstate_Agent_Benchmark_2026.xlsx", engine='openpyxl') as writer:
-        # Full Raw Data
+    with pd.ExcelWriter("RealEstate_Production_Benchmark.xlsx", engine='openpyxl') as writer:
         df.to_excel(writer, sheet_name="Raw Data", index=False)
         
-        # Cross-Model Logic Comparison
         comparison = df.pivot(index="Query", columns="Model", values="SQL_Filters")
         comparison.to_excel(writer, sheet_name="Logic Comparison")
         
-        # Performance Leaderboard
         leaderboard = df.groupby("Model").agg({
             "Latency_ms": ["mean", "min", "max"],
             "Status": lambda x: (x == "SUCCESS").sum()
         }).reset_index()
         leaderboard.to_excel(writer, sheet_name="Leaderboard")
 
-    print(f"🎉 Done! Report saved as 'RealEstate_Agent_Benchmark_2026.xlsx'")
+    print(f"🎉 Done! Report saved as 'RealEstate_Production_Benchmark.xlsx'")
 
 if __name__ == "__main__":
     run_benchmark()
